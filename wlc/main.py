@@ -22,9 +22,11 @@ import csv
 import http.client
 import json
 import logging
+import re
 import sys
 from argparse import ArgumentParser
 from datetime import datetime
+from pathlib import Path
 from typing import Callable, Dict, List
 
 import argcomplete
@@ -36,6 +38,11 @@ from wlc.config import NoOptionError, WeblateConfig
 COMMANDS: Dict[str, Callable] = {}
 
 SORT_ORDER: List[str] = []
+
+
+def sanitize_slug(slug):
+    """Sanitize slug for safe use as a filename component."""
+    return re.sub(r"[^a-zA-Z0-9_]", "-", slug)
 
 
 def register_command(command):
@@ -631,11 +638,14 @@ class Unlock(ComponentCommand):
 
 
 @register_command
-class Download(TranslationCommand):
+class Download(ObjectCommand):
     """Downloads translation file."""
 
     name = "download"
-    description = "Downloads translation file"
+    description = """
+    Downloads translation file for a project, a component or a file
+    For a project or a component we will download a zip to --output
+    """
 
     @classmethod
     def add_parser(cls, subparser):
@@ -645,19 +655,77 @@ class Download(TranslationCommand):
             "-c", "--convert", help="Convert file format on server (defaults to none)"
         )
         parser.add_argument(
-            "-o", "--output", help="File where to store output (defaults to stdout)"
+            "-o",
+            "--output",
+            help="File|Directory where to store output (defaults to stdout)",
+        )
+        parser.add_argument(
+            "-g",
+            "--no-glossary",
+            action="store_true",
+            default=False,
+            help="Disable download glossary (defaults to False)",
         )
         return parser
 
+    def download_component(self, component):
+        """
+        Download a single component as file (if not a translation).
+        """
+
+        content = component.download(self.args.convert)
+        if self.args.output is None:
+            raise CommandError("Output is needed for download!")
+
+        directory = Path(self.args.output)
+        file_path = directory / (
+            f"{sanitize_slug(component.project.slug)}-{sanitize_slug(component.slug)}.zip"
+        )
+        directory.mkdir(exist_ok=True, parents=True)
+        file_path.write_bytes(content)
+
+    def download_components(self, iterable):
+        for component in iterable:
+            # Ignore glossary via --no-glossary
+            if getattr(component, "is_glossary", False) and self.args.no_glossary:
+                continue
+            self.download_component(component)
+            item = f"{component.project.slug}/{component.slug}"
+            self.println(f"downloaded translations for component: {item}")
+
     def run(self):
         """Executor."""
-        obj = self.get_object()
-        content = obj.download(self.args.convert)
-        if self.args.output and self.args.output != "-":
-            with open(self.args.output, "wb") as handle:
-                handle.write(content)
-        else:
-            self.stdout.buffer.write(content)
+        obj = self.get_object(blank=True)
+
+        # Translation locale for a component
+        if isinstance(obj, wlc.Translation):
+            content = obj.download(self.args.convert)
+            if self.args.output and self.args.output != "-":
+                with open(self.args.output, "wb") as handle:
+                    handle.write(content)
+            else:
+                self.stdout.buffer.write(content)
+            return
+
+        # All translations for a component
+        if isinstance(obj, wlc.Component):
+            for component in self.wlc.list_components():
+                # Only download for the component we scoped
+                if obj.slug == component.slug:
+                    self.download_component(component)
+                    self.println(
+                        f"downloaded translations for component: {self.args.object[0]}"
+                    )
+
+            return
+
+        # All translations for a project
+        if isinstance(obj, wlc.Project):
+            self.download_components(obj.list())
+            self.println(f"downloaded translations for project: {self.args.object[0]}")
+            return
+
+        self.download_components(self.wlc.list_components())
 
 
 @register_command
